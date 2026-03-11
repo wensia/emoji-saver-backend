@@ -32,21 +32,21 @@ function generateId() {
 // ==================== 解析消息（兼容 JSON 和 XML） ====================
 
 async function parseWxMessage(ctx) {
-  const contentType = ctx.request.headers["content-type"] || "";
+  const body = ctx.request.body;
 
-  // JSON 模式
-  if (contentType.includes("application/json")) {
-    return ctx.request.body;
+  // 已经是 JSON 对象（被 raw body 中间件解析过）
+  if (typeof body === "object" && body !== null) {
+    return body;
   }
 
-  // XML 模式：从 raw body 解析
-  if (contentType.includes("text/xml") || contentType.includes("application/xml")) {
-    const result = await parseStringPromise(ctx.request.body, { explicitArray: false });
+  // 字符串：尝试 XML 解析
+  if (typeof body === "string" && body.trim().startsWith("<")) {
+    const result = await parseStringPromise(body, { explicitArray: false });
     return result.xml;
   }
 
-  // 兜底：尝试当 JSON 处理
-  return ctx.request.body;
+  // 兜底
+  return body || {};
 }
 
 // 构建 XML 文本回复
@@ -288,20 +288,22 @@ router.get("/", async (ctx) => {
 
 const app = new Koa();
 
-// 解析 XML raw body（微信消息是 text/xml 格式）
+// /wx 路由：先读取 raw body，再统一解析（兼容 JSON 和 XML）
 app.use(async (ctx, next) => {
   if (ctx.path === "/wx" && ctx.method === "POST") {
-    const contentType = ctx.request.headers["content-type"] || "";
-    if (contentType.includes("xml")) {
-      const rawBody = await new Promise((resolve, reject) => {
-        let data = "";
-        ctx.req.on("data", (chunk) => (data += chunk));
-        ctx.req.on("end", () => resolve(data));
-        ctx.req.on("error", reject);
-      });
+    const rawBody = await new Promise((resolve, reject) => {
+      let data = "";
+      ctx.req.on("data", (chunk) => (data += chunk));
+      ctx.req.on("end", () => resolve(data));
+      ctx.req.on("error", reject);
+    });
+    // 尝试 JSON 解析，失败则保留原始字符串（XML）
+    try {
+      ctx.request.body = JSON.parse(rawBody);
+    } catch {
       ctx.request.body = rawBody;
-      return next();
     }
+    return next();
   }
   return next();
 });
