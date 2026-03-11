@@ -5,6 +5,7 @@ const bodyParser = require("koa-bodyparser");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const { parseStringPromise } = require("xml2js");
 const { init: initDB, Image } = require("./db");
 
 const router = new Router();
@@ -28,41 +29,110 @@ function generateId() {
   return id;
 }
 
-// ==================== 微信公众号消息推送（JSON 模式） ====================
+// ==================== 解析消息（兼容 JSON 和 XML） ====================
+
+async function parseWxMessage(ctx) {
+  const contentType = ctx.request.headers["content-type"] || "";
+
+  // JSON 模式
+  if (contentType.includes("application/json")) {
+    return ctx.request.body;
+  }
+
+  // XML 模式：从 raw body 解析
+  if (contentType.includes("text/xml") || contentType.includes("application/xml")) {
+    const result = await parseStringPromise(ctx.request.body, { explicitArray: false });
+    return result.xml;
+  }
+
+  // 兜底：尝试当 JSON 处理
+  return ctx.request.body;
+}
+
+// 构建 XML 文本回复
+function buildXmlTextReply(fromUser, toUser, content) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  return `<xml>
+  <ToUserName><![CDATA[${fromUser}]]></ToUserName>
+  <FromUserName><![CDATA[${toUser}]]></FromUserName>
+  <CreateTime>${timestamp}</CreateTime>
+  <MsgType><![CDATA[text]]></MsgType>
+  <Content><![CDATA[${content}]]></Content>
+</xml>`;
+}
+
+// 根据请求类型返回对应格式的响应
+function reply(ctx, fromUser, toUser, content) {
+  const contentType = ctx.request.headers["content-type"] || "";
+  if (contentType.includes("text/xml") || contentType.includes("application/xml")) {
+    ctx.type = "text/xml";
+    ctx.body = buildXmlTextReply(fromUser, toUser, content);
+  } else {
+    ctx.body = {
+      ToUserName: fromUser,
+      FromUserName: toUser,
+      CreateTime: Math.floor(Date.now() / 1000),
+      MsgType: "text",
+      Content: content,
+    };
+  }
+}
+
+// ==================== 微信公众号消息推送 ====================
 
 router.post("/wx", async (ctx) => {
-  const msg = ctx.request.body;
+  let msg;
+  try {
+    msg = await parseWxMessage(ctx);
+  } catch (err) {
+    console.error("解析消息失败:", err);
+    ctx.body = "success";
+    return;
+  }
 
   console.log("收到微信消息:", JSON.stringify(msg));
 
   const { MsgType, FromUserName, ToUserName } = msg;
 
-  // 只处理图片消息
-  if (MsgType !== "image") {
-    ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: Math.floor(Date.now() / 1000),
-      MsgType: "text",
-      Content: "请发送表情包图片，我会帮你保存原图哦~",
-    };
+  // 处理图片和表情消息
+  if (MsgType !== "image" && MsgType !== "emoticon") {
+    reply(ctx, FromUserName, ToUserName, "请发送表情包图片，我会帮你保存原图哦~");
     return;
   }
 
   const { PicUrl, MediaId } = msg;
 
+  // emoticon 类型可能没有 PicUrl，需要通过 MediaId 下载
+  if (!PicUrl && !MediaId) {
+    reply(ctx, FromUserName, ToUserName, "无法获取表情包图片，请重试~");
+    return;
+  }
+
   try {
     const id = generateId();
 
-    // 下载图片
-    const response = await axios.get(PicUrl, {
-      responseType: "arraybuffer",
-      timeout: 4000,
-    });
-    const buffer = Buffer.from(response.data);
+    let buffer;
+    let contentType = "image/gif";
 
-    // 检测图片类型
-    const contentType = response.headers["content-type"] || "image/png";
+    if (PicUrl) {
+      // 通过 PicUrl 下载
+      const response = await axios.get(PicUrl, {
+        responseType: "arraybuffer",
+        timeout: 4000,
+      });
+      buffer = Buffer.from(response.data);
+      contentType = response.headers["content-type"] || "image/png";
+    } else {
+      // 通过 MediaId 从微信 API 下载（云托管内部可免 access_token）
+      const mediaUrl = `http://api.weixin.qq.com/cgi-bin/media/get?media_id=${MediaId}`;
+      const response = await axios.get(mediaUrl, {
+        responseType: "arraybuffer",
+        timeout: 4000,
+      });
+      buffer = Buffer.from(response.data);
+      contentType = response.headers["content-type"] || "image/gif";
+    }
+
     const ext = contentType.includes("gif")
       ? ".gif"
       : contentType.includes("jpeg")
@@ -71,37 +141,22 @@ router.post("/wx", async (ctx) => {
     const fileName = `${id}${ext}`;
     const filePath = path.join(UPLOAD_DIR, fileName);
 
-    // 保存文件
     fs.writeFileSync(filePath, buffer);
 
-    // 保存到数据库
     await Image.create({
       id,
       openid: FromUserName,
-      picUrl: PicUrl,
+      picUrl: PicUrl || "",
       mediaId: MediaId,
       filePath: fileName,
       mimeType: contentType,
     });
 
     const downloadUrl = `${BASE_URL}/download/${id}`;
-
-    ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: Math.floor(Date.now() / 1000),
-      MsgType: "text",
-      Content: `表情包已保存！点击查看并保存原图：\n${downloadUrl}`,
-    };
+    reply(ctx, FromUserName, ToUserName, `表情包已保存！点击查看并保存原图：\n${downloadUrl}`);
   } catch (err) {
     console.error("处理图片失败:", err);
-    ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: Math.floor(Date.now() / 1000),
-      MsgType: "text",
-      Content: "保存失败了，请稍后重试~",
-    };
+    reply(ctx, FromUserName, ToUserName, "保存失败了，请稍后重试~");
   }
 });
 
@@ -137,8 +192,11 @@ router.get("/api/image/:id/file", async (ctx) => {
   if (fs.existsSync(filePath)) {
     ctx.type = image.mimeType || "image/png";
     ctx.body = fs.createReadStream(filePath);
-  } else {
+  } else if (image.picUrl) {
     ctx.redirect(image.picUrl);
+  } else {
+    ctx.status = 404;
+    ctx.body = "图片文件不存在";
   }
 });
 
@@ -217,6 +275,25 @@ router.get("/", async (ctx) => {
 // ==================== 启动应用 ====================
 
 const app = new Koa();
+
+// 解析 XML raw body（微信消息是 text/xml 格式）
+app.use(async (ctx, next) => {
+  if (ctx.path === "/wx" && ctx.method === "POST") {
+    const contentType = ctx.request.headers["content-type"] || "";
+    if (contentType.includes("xml")) {
+      const rawBody = await new Promise((resolve, reject) => {
+        let data = "";
+        ctx.req.on("data", (chunk) => (data += chunk));
+        ctx.req.on("end", () => resolve(data));
+        ctx.req.on("error", reject);
+      });
+      ctx.request.body = rawBody;
+      return next();
+    }
+  }
+  return next();
+});
+
 app
   .use(logger())
   .use(bodyParser())
