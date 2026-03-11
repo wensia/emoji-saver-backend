@@ -92,6 +92,12 @@ router.post("/wx", async (ctx) => {
 
   console.log("收到微信消息:", JSON.stringify(msg));
 
+  // 云托管路径检查 or 无效消息，直接返回 success
+  if (!msg || !msg.MsgType || msg.action) {
+    ctx.body = "success";
+    return;
+  }
+
   const { MsgType, FromUserName, ToUserName } = msg;
 
   // 处理图片和表情消息
@@ -158,6 +164,12 @@ router.post("/wx", async (ctx) => {
     console.error("处理图片失败:", err);
     reply(ctx, FromUserName, ToUserName, "保存失败了，请稍后重试~");
   }
+});
+
+// 微信签名验证 / 路径检查（GET）
+router.get("/wx", async (ctx) => {
+  const { echostr } = ctx.query;
+  ctx.body = echostr || "success";
 });
 
 // ==================== 图片接口 ====================
