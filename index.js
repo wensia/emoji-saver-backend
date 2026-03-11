@@ -102,7 +102,13 @@ router.post("/wx", async (ctx) => {
 
   // 处理图片和表情消息
   if (MsgType !== "image" && MsgType !== "emoticon") {
-    reply(ctx, FromUserName, ToUserName, "请发送表情包图片，我会帮你保存原图哦~");
+    // 检测是否为表情包被转成的文本
+    const content = msg.Content || "";
+    if (content.includes("收到不支持的消息类型")) {
+      reply(ctx, FromUserName, ToUserName, "暂不支持直接发送表情贴纸哦~\n\n请长按表情包 → 选择「发送给朋友」→ 转发到本公众号，即可保存原图！");
+      return;
+    }
+    reply(ctx, FromUserName, ToUserName, "请发送图片或转发表情包给我，我会帮你保存原图哦~");
     return;
   }
 
